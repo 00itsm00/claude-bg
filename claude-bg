@@ -122,6 +122,17 @@ running_sessions() {
   tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^claude(-|$)'
 }
 
+# A tmux session can outlive the `claude` process inside it (crash, an
+# unhandled first-run prompt, etc.) — has-session alone can't tell a live
+# instance from a dead shell sitting in the pane, so check what's actually
+# running in the foreground.
+is_alive() {
+  local SESSION="$1"
+  local RUNNING
+  RUNNING=$(tmux list-panes -t "$SESSION" -F '#{pane_current_command}' 2>/dev/null | head -1)
+  [ "$RUNNING" = "claude" ]
+}
+
 CMD="$1"
 case "$CMD" in
   start)
@@ -135,9 +146,13 @@ case "$CMD" in
       NAME=$(basename "${DIR%/}")
     fi
     SESSION=$(session_for "$NAME")
-    if tmux has-session -t "$SESSION" 2>/dev/null; then
+    if tmux has-session -t "$SESSION" 2>/dev/null && is_alive "$SESSION"; then
       echo "Instance '${NAME:-default}' (session $SESSION) already running. Use 'claude-bg link ${NAME}' to get the phone link again, or pick a different name to start another instance."
     else
+      if tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "Instance '${NAME:-default}' (session $SESSION) had exited or gotten stuck — relaunching."
+        tmux kill-session -t "$SESSION" 2>/dev/null
+      fi
       launch "$SESSION" "$DIR" "$NAME"
       echo "Started instance '${NAME:-default}' (session $SESSION) in background at $DIR"
       echo "Fetching remote link..."
@@ -191,12 +206,16 @@ case "$CMD" in
     NAME=$(resolve_name "$2")
     SESSION=$(session_for "$NAME")
     if tmux has-session -t "$SESSION" 2>/dev/null; then
-      PANE=$(tmux capture-pane -p -t "$SESSION")
-      LINK=$(echo "$PANE" | grep -Eo 'https://claude\.ai/code/[^ ]*' | tail -1)
-      if [ -n "$LINK" ]; then
-        echo "$LINK"
+      if ! is_alive "$SESSION"; then
+        echo "'${NAME:-default}' (session $SESSION) exited or got stuck. Run 'claude-bg start' with the same directory to relaunch it."
       else
-        echo "No link found yet. Try 'claude-bg attach ${NAME}' to check what's happening."
+        PANE=$(tmux capture-pane -p -t "$SESSION")
+        LINK=$(echo "$PANE" | grep -Eo 'https://claude\.ai/code/[^ ]*' | tail -1)
+        if [ -n "$LINK" ]; then
+          echo "$LINK"
+        else
+          echo "No link found yet. Try 'claude-bg attach ${NAME}' to check what's happening."
+        fi
       fi
     else
       echo "Not running. Use 'claude-bg start <dir> ${NAME}' first."
