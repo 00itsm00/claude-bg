@@ -19,8 +19,23 @@ if ! command -v tmux >/dev/null 2>&1; then
   apt-get install -y tmux
 fi
 
-if ! command -v claude >/dev/null 2>&1; then
-  echo "Note: the 'claude' CLI isn't on PATH yet. claude-bg launches it, so install"
+CLAUDE_FOUND=0
+if command -v claude >/dev/null 2>&1; then
+  CLAUDE_FOUND=1
+else
+  # sudo strips ~/.local/bin from PATH, which is where Claude Code normally
+  # lives — check the real user's home (and root's) before warning.
+  for CAND in "/root/.local/bin/claude" "$HOME/.local/bin/claude"; do
+    [ -x "$CAND" ] && CLAUDE_FOUND=1 && break
+  done
+  if [ "$CLAUDE_FOUND" -eq 0 ] && [ -n "$SUDO_USER" ]; then
+    SUDO_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    [ -n "$SUDO_HOME" ] && [ -x "$SUDO_HOME/.local/bin/claude" ] && CLAUDE_FOUND=1
+  fi
+fi
+
+if [ "$CLAUDE_FOUND" -eq 0 ]; then
+  echo "Note: the 'claude' CLI isn't installed yet. claude-bg launches it, so install"
   echo "Claude Code first if you haven't: https://docs.claude.com/en/docs/claude-code"
 fi
 
