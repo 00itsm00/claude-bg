@@ -1,0 +1,260 @@
+#!/bin/bash
+# Default instance name is "default" -> tmux session "claude".
+# Any other name -> tmux session "claude-<name>", so you can run several
+# instances in parallel, each pointed at its own directory.
+#
+# Every instance is launched with `claude --remote-control <name>`, so as
+# soon as it's up you can pull it up on your phone or at claude.ai/code
+# (the "/rc" indicator you see in a normal session is Remote Control).
+
+STATE_DIR="${CLAUDE_BG_STATE_DIR:-$HOME/.claude-bg}"
+mkdir -p "$STATE_DIR"
+
+sanitize() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-'
+}
+
+# Accepts either a plain instance name ("hc") or a directory path
+# ("/root/hc" or "hc/"), and resolves it to the instance name (basename
+# of the path, trailing slashes stripped) so 'stop', 'attach', etc. work
+# with either form.
+resolve_name() {
+  local ARG="$1"
+  if [ -z "$ARG" ]; then
+    echo ""
+  elif [[ "$ARG" == */* ]]; then
+    basename "$ARG"
+  else
+    echo "$ARG"
+  fi
+}
+
+session_for() {
+  local NAME="$1"
+  if [ -z "$NAME" ] || [ "$NAME" = "default" ]; then
+    echo "claude"
+  else
+    echo "claude-$(sanitize "$NAME")"
+  fi
+}
+
+state_file() {
+  echo "$STATE_DIR/$1.dir"
+}
+
+launch() {
+  local SESSION="$1"
+  local DIR="$2"
+  local NAME="$3"
+  local RC_NAME
+  RC_NAME=$(sanitize "${NAME:-default}")
+  echo "$DIR" >"$(state_file "$SESSION")"
+  tmux new-session -d -s "$SESSION" -c "$DIR"
+  tmux send-keys -t "$SESSION" "claude --remote-control $RC_NAME" Enter
+}
+
+# Polls the session until it's dead, or a remote-control link shows up.
+# Auto-confirms the one-time "trust this folder" prompt along the way.
+wait_ready() {
+  local SESSION="$1"
+  local CONFIRMED=0
+  local i PANE LINK
+  for i in $(seq 1 30); do
+    sleep 1
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+      echo "__DEAD__"
+      return 1
+    fi
+    PANE=$(tmux capture-pane -p -t "$SESSION" 2>/dev/null)
+    if [ "$CONFIRMED" -eq 0 ] && echo "$PANE" | grep -qi "trust this folder"; then
+      # The trust prompt is an arrow-key menu; "No, exit" is listed (and
+      # defaults to highlighted) above "Yes, I trust this folder" in this
+      # Claude Code version, so a bare Enter would exit instead of trusting.
+      # Figure out which option comes first and navigate to "Yes" before confirming.
+      local NO_LINE YES_LINE
+      NO_LINE=$(echo "$PANE" | grep -n "No, exit" | tail -1 | cut -d: -f1)
+      YES_LINE=$(echo "$PANE" | grep -n "Yes, I trust this folder" | tail -1 | cut -d: -f1)
+      if [ -n "$NO_LINE" ] && [ -n "$YES_LINE" ] && [ "$NO_LINE" -lt "$YES_LINE" ]; then
+        tmux send-keys -t "$SESSION" Down Enter
+      else
+        tmux send-keys -t "$SESSION" Enter
+      fi
+      CONFIRMED=1
+      continue
+    fi
+    LINK=$(echo "$PANE" | grep -Eo 'https://claude\.ai/code/[^ ]*' | tail -1)
+    if [ -n "$LINK" ]; then
+      echo "$LINK"
+      return 0
+    fi
+  done
+  return 1
+}
+
+report() {
+  case "$1" in
+    __DEAD__)
+      echo "Claude exited. Run 'claude-bg attach $2' to see why."
+      ;;
+    "")
+      echo "No link yet — run 'claude-bg link $2' shortly, or 'claude-bg attach $2' to check."
+      ;;
+    *)
+      echo "Open this on your phone (Claude app or claude.ai/code):"
+      echo "$1"
+      ;;
+  esac
+}
+
+stop_one() {
+  local NAME="$1"
+  local SESSION
+  SESSION=$(session_for "$NAME")
+  if tmux kill-session -t "$SESSION" 2>/dev/null; then
+    rm -f "$(state_file "$SESSION")"
+    echo "Stopped '${NAME:-default}' (session $SESSION)."
+  else
+    echo "'${NAME:-default}' (session $SESSION): not running."
+  fi
+}
+
+running_sessions() {
+  tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^claude(-|$)'
+}
+
+CMD="$1"
+case "$CMD" in
+  start)
+    if [ -n "$2" ]; then
+      DIR="$2"
+    else
+      DIR="$HOME"
+    fi
+    NAME="$3"
+    if [ -z "$NAME" ] && [ -n "$2" ]; then
+      NAME=$(basename "${DIR%/}")
+    fi
+    SESSION=$(session_for "$NAME")
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      echo "Instance '${NAME:-default}' (session $SESSION) already running. Use 'claude-bg link ${NAME}' to get the phone link again, or pick a different name to start another instance."
+    else
+      launch "$SESSION" "$DIR" "$NAME"
+      echo "Started instance '${NAME:-default}' (session $SESSION) in background at $DIR"
+      echo "Fetching remote link..."
+      report "$(wait_ready "$SESSION")" "$NAME"
+    fi
+    ;;
+  stop)
+    if [ "$2" = "all" ] || [ "$2" = "--all" ]; then
+      RUNNING=$(running_sessions)
+      if [ -z "$RUNNING" ]; then
+        echo "No claude-bg instances running."
+      else
+        echo "$RUNNING" | while read -r S; do
+          if [ "$S" = "claude" ]; then N=""; else N="${S#claude-}"; fi
+          stop_one "$N"
+        done
+      fi
+    else
+      stop_one "$(resolve_name "$2")"
+    fi
+    ;;
+  restart)
+    NAME=$(resolve_name "$2")
+    SESSION=$(session_for "$NAME")
+    if [ -n "$3" ]; then
+      DIR="$3"
+    elif [ -f "$(state_file "$SESSION")" ]; then
+      DIR=$(cat "$(state_file "$SESSION")")
+    else
+      DIR="$HOME"
+    fi
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    launch "$SESSION" "$DIR" "$NAME"
+    echo "Restarted instance '${NAME:-default}' (session $SESSION) at $DIR"
+    report "$(wait_ready "$SESSION")" "$NAME"
+    ;;
+  cd)
+    if [ -z "$2" ]; then
+      echo "Usage: claude-bg cd /path/to/dir [name]"
+    else
+      DIR="$2"
+      NAME="$3"
+      SESSION=$(session_for "$NAME")
+      tmux kill-session -t "$SESSION" 2>/dev/null
+      launch "$SESSION" "$DIR" "$NAME"
+      echo "Switched instance '${NAME:-default}' (session $SESSION) to $DIR"
+      report "$(wait_ready "$SESSION")" "$NAME"
+    fi
+    ;;
+  link)
+    NAME=$(resolve_name "$2")
+    SESSION=$(session_for "$NAME")
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+      PANE=$(tmux capture-pane -p -t "$SESSION")
+      LINK=$(echo "$PANE" | grep -Eo 'https://claude\.ai/code/[^ ]*' | tail -1)
+      if [ -n "$LINK" ]; then
+        echo "$LINK"
+      else
+        echo "No link found yet. Try 'claude-bg attach ${NAME}' to check what's happening."
+      fi
+    else
+      echo "Not running. Use 'claude-bg start <dir> ${NAME}' first."
+    fi
+    ;;
+  attach)
+    NAME=$(resolve_name "$2")
+    SESSION=$(session_for "$NAME")
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+      echo "'${NAME:-default}' (session $SESSION): not running."
+    elif [ -n "$TMUX" ]; then
+      # Already inside a tmux session (e.g. this very shell) — attach would
+      # refuse with "sessions should be nested with care", so jump instead.
+      tmux switch-client -t "$SESSION"
+    else
+      tmux attach -t "$SESSION"
+    fi
+    ;;
+  status)
+    NAME=$(resolve_name "$2")
+    SESSION=$(session_for "$NAME")
+    tmux has-session -t "$SESSION" 2>/dev/null && echo "'${NAME:-default}' (session $SESSION): Running." || echo "'${NAME:-default}' (session $SESSION): Not running."
+    ;;
+  list)
+    RUNNING=$(running_sessions)
+    if [ -z "$RUNNING" ]; then
+      echo "No claude-bg instances running."
+    else
+      echo "Running instances:"
+      echo "$RUNNING" | while read -r S; do
+        if [ "$S" = "claude" ]; then N="default"; else N="${S#claude-}"; fi
+        DIR=$(cat "$(state_file "$S")" 2>/dev/null)
+        if [ -n "$DIR" ]; then
+          echo "  $N (session $S) — $DIR"
+        else
+          echo "  $N (session $S)"
+        fi
+      done
+    fi
+    ;;
+  *)
+    echo "Usage: claude-bg {start <dir> [name]|stop <name|dir>|stop all|restart [name] [dir]|cd <dir> [name]|link [name|dir]|attach [name|dir]|status [name|dir]|list}"
+    echo ""
+    echo "Every instance starts with Remote Control already on (claude --remote-control <name>),"
+    echo "so the phone/claude.ai/code link is ready as soon as 'start' returns."
+    echo ""
+    echo "Instance name defaults to the directory's basename, e.g. 'start /root/hc' -> instance 'hc'."
+    echo "Anywhere a [name] is expected, you can pass the full directory path instead — its"
+    echo "basename is used to find the matching instance."
+    echo ""
+    echo "  claude-bg start /root/hc            # start & print the remote link (instance 'hc')"
+    echo "  claude-bg start ~/project-b beta    # explicit name overrides the directory basename"
+    echo "  claude-bg list                      # see what's running and where"
+    echo "  claude-bg attach hc                 # or: claude-bg attach /root/hc"
+    echo "  claude-bg restart hc                # relaunch in its last directory"
+    echo "  claude-bg stop hc                   # or: claude-bg stop /root/hc"
+    echo "  claude-bg stop all                  # stop everything"
+    echo ""
+    echo "Omitting [name]/[dir] uses the 'default' instance (backward compatible)."
+    ;;
+esac
